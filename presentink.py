@@ -30,6 +30,7 @@ from lxml import etree
 import os
 from sys import argv
 import filecmp
+import copy
 
 # Configuration
 if len(argv) < 2:
@@ -50,6 +51,10 @@ doc = etree.fromstringlist(open(srcfile)).getroottree()
 ns = doc.getroot().nsmap
 layers = doc.findall('/svg:g[@inkscape:groupmode="layer"]', namespaces=ns)
 
+##clean ids so that rerenders are not triggered by spurious id changes
+#for element in doc.iter():
+#    print(element.attrib['id'])
+
 #remove unnecesary information, otherwise this leads to unnecesary inkscape stuff causing recreation of pdfs
 namedviews = doc.findall("{"+ns["sodipodi"]+'}namedview')
 if len(namedviews) == 0:
@@ -63,7 +68,7 @@ subst_elements = [] # Text elements where we have to substitute something
 subst_strings = [] # The corresponding strings of text
 
 for t in texts:
-    if t.text is not None and t.text.find('${slide}') is not -1:
+    if t.text != None and t.text.find('$PNUM') != -1:
         subst_elements.append(t)
         subst_strings.append(t.text)
 
@@ -89,12 +94,13 @@ last_visible_layer = None
 for l in layers:
     l.attrib['style'] = 'display:none'
     label = l.attrib['{'+ns['inkscape']+'}label']
-    if label[0] is not '.' and label[0] is not '_':
+    if label[0] != '.' and label[0] != '_':
         last_visible_layer = l
 
 # Second pass:
 # Build up the layers and create files
-slide_num = 0 # Number that we put into slides
+slide_num = 0 # Number of each slide used when saving temporary files
+actual_slide_num = 0 # Number that we put into slides
 page_count = 0 # Used to name the PDF files we export, name is (slide_num)_(page_count),
                # and page count is reset for each new normal layer.
 
@@ -107,10 +113,10 @@ pdf_path_list = "" # string with names of all pdfs to join
 for i,l in enumerate(layers):
 
     label = l.attrib['{'+ns['inkscape']+'}label']
-    if label[0] is '.':
+    if label[0] == '.':
         # Hidden, just skip this layer
         continue
-    elif label[0] is '-':
+    elif label[0] == '-':
         # clear additional layers and go to the next one
         # if slide title is just "-", clear all additional slides
         if len(label) == 1:
@@ -130,7 +136,7 @@ for i,l in enumerate(layers):
                 print("layers starting with '-' should have an integer, or nothing following")
                 sys.exit(0)
         continue
-    elif label[0] is '!':
+    elif label[0] == '!':
         # clear base layers and go to the next one. Change will appear
         # at the next normal slide
         # if slide title is just "!", clear all base slides
@@ -151,11 +157,11 @@ for i,l in enumerate(layers):
                 print("layers starting with '!' should have an integer, or nothing following")
                 sys.exit(0)
         continue
-    elif label[0] is '_':
+    elif label[0] == '_':
         # Base layer, add it to the list but don't make a slide for it
         base_layers.append(l)
         continue
-    elif label[0] is '+':
+    elif label[0] == '+':
         # Additive layer, just append it to the current list
         additional_layers.append(l);
     else:
@@ -163,43 +169,63 @@ for i,l in enumerate(layers):
         additional_layers = []
         visible_layers = base_layers + [l];
         slide_num += 1
+        actual_slide_num += 1
         page_count = 0
 
-    if coalesce_animations and l is not last_visible_layer:
+    if coalesce_animations and l != last_visible_layer:
         next_label = layers[i+1].attrib['{http://www.inkscape.org/namespaces/inkscape}label']
-        if next_label[0] is '+' or next_label[0] is '.':
+        if next_label[0] == '+' or next_label[0] == '.':
             # Then don't render just yet
-            print("skipping!")
             continue
 
     for vl in visible_layers + additional_layers:
         vl.attrib['style'] = 'display:inline'
 
+    # Check for any adjustements to slide number
+    setpnum_index = label.find("$SETPNUM=")
+    if (setpnum_index != -1):
+        try:
+            actual_slide_num = int(label[label.find("$SETPNUM=")+len("$SETPNUM="):])
+        except ValueError:
+            print("Error when using $SETPNUM in slide "+label)
+    if (label.find("$SETPNUM-") != -1):
+        actual_slide_num -= 1
+    if (label.find("$SETPNUM+") != -1):
+        actual_slide_num += 1
+
+    if (label.find("$SKIPRENDER") != -1):
+        continue
+
     # Do the string substitutions
     for s in range(len(subst_elements)):
-        subst_elements[s].text = subst_strings[s].replace('${slide}', str(slide_num))
+        subst_elements[s].text = subst_strings[s].replace('$PNUM', str(actual_slide_num))
 
     # Save the updated SVG file
-    doc.write(tmpsvg)
-    # open the updated SVG, trim it of non visible items and save back
-    tmpdoc = etree.fromstringlist(open(tmpsvg)).getroottree()
-    tmplayers = tmpdoc.findall('/svg:g[@inkscape:groupmode="layer"]', namespaces=ns)
-    for tmp_l in tmplayers:
-        if tmp_l.attrib['style'] == 'display:none':
+    tmpdoc = copy.deepcopy(doc)
+    tmp_layers = tmpdoc.findall('/svg:g[@inkscape:groupmode="layer"]', namespaces=ns)
+    for tmp_l in tmp_layers:
+        if 'style' in tmp_l.attrib.keys() and tmp_l.attrib['style'] == 'display:none':
             tmp_l.getparent().remove(tmp_l)
     tmpdoc.write(tmpsvg)
+    # To check if the file has been modified, save another copy without the "defs" element.
+    # Layers marked as not visible can change this section, triggering a full render of
+    # all slides for small changes. To prevent this we only compare the new svg to the
+    # previous one with defs stripped.
+    tmp_layers = tmpdoc.findall('/svg:defs', namespaces=ns)
+    for tmp_l in tmp_layers:
+        tmp_l.getparent().remove(tmp_l)
+    tmpdoc.write(tmpsvg+"_no_defs")
 
     # Call Inkscape to render it
     pdf_name = tmpdir + os.path.sep + "slide-{:03d}_{:03d}.pdf".format(slide_num, page_count)
     page_count += 1
-
     pdf_path_list += pdf_name + " "
     
     # Check if it's neccesary to render this file again
     final_svg_name = tmpdir+os.path.sep+"slide-{:03d}_{:03d}.svg".format(slide_num, page_count-1)
     if os.path.isfile(pdf_name):
-        if os.path.isfile(final_svg_name) and \
-                filecmp.cmp(final_svg_name, tmpsvg):
+        if os.path.isfile(final_svg_name+"_no_defs") and \
+                filecmp.cmp(final_svg_name+"_no_defs", tmpsvg+"_no_defs"):
             # already created this svg, just move on
             print("Skipping "+pdf_name)
             # Restore things back to the way they were for the next run
@@ -209,10 +235,11 @@ for i,l in enumerate(layers):
 
     # this is a new svg, move it to its final location
     os.system("mv "+tmpsvg+" "+final_svg_name)
+    os.system("mv "+tmpsvg+"_no_defs"+" "+final_svg_name+"_no_defs")
 
     print("Exporting {id} as {name}".format(id=l.attrib['id'], name=pdf_name))
     # calling inkscape with "export-ignore-filters" prevents rasterization of embedded pdfs
-    os.system("inkscape --export-ignore-filters --export-pdf={path} --export-area-page {svgfile}".format(path=pdf_name, svgfile=final_svg_name))
+    os.system("inkscape --export-ignore-filters --export-filename={path} --export-area-page {svgfile}".format(path=pdf_name, svgfile=final_svg_name))
 
     # Restore things back to the way they were for the next run
     for vl in visible_layers + additional_layers:
