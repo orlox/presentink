@@ -214,6 +214,14 @@ for i,l in enumerate(layers):
     tmp_layers = tmpdoc.findall('/svg:defs', namespaces=ns)
     for tmp_l in tmp_layers:
         tmp_l.getparent().remove(tmp_l)
+    # text and tspan elements can swap ids even with small changes in different slides. Remove those
+    # ids to prevent artificial rerendering of all doc
+    text_elements = tmpdoc.findall('//*text', namespaces=ns)
+    for text_element in text_elements:
+        etree.strip_attributes(text_element,'id')
+    tspan_elements = tmpdoc.findall('//*tspan', namespaces=ns)
+    for tspan_element in tspan_elements:
+        etree.strip_attributes(tspan_element,'id')
     tmpdoc.write(tmpsvg+"_no_defs")
 
     # Call Inkscape to render it
